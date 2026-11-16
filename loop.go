@@ -85,7 +85,7 @@ func startBackgroundLoop(configPath string, every time.Duration, dryRun bool, ou
 		return fmt.Errorf("a background loop is already running (pid %d); stop it with `garbaj stop`", pid)
 	}
 	// Refuse to start a loop that "stop" could not find again later.
-	if _, _, err := processName(os.Getpid()); err != nil {
+	if err := checkInspection(); err != nil {
 		return fmt.Errorf("cannot inspect processes, which `garbaj stop` needs: %w", err)
 	}
 	exe, err := os.Executable()
@@ -182,7 +182,25 @@ func runningLoopPid() (pid int, running bool, err error) {
 		return pid, false, fmt.Errorf("cannot tell whether pid %d from %s is a running garbaj loop: %w",
 			pid, pidFilePath(), err)
 	}
+	if !found && !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		// The process exists but the lookup did not see it: that is a broken
+		// inspection, not an exited loop.
+		return pid, false, fmt.Errorf("pid %d from %s is alive but could not be inspected", pid, pidFilePath())
+	}
 	return pid, found && isGarbaj(name), nil
+}
+
+// checkInspection proves the lookup can see a live garbaj process by asking
+// about this one.
+func checkInspection() error {
+	name, found, err := processName(os.Getpid())
+	if err != nil {
+		return err
+	}
+	if !found || !isGarbaj(name) {
+		return fmt.Errorf("process lookup does not report this garbaj process (got %q)", name)
+	}
+	return nil
 }
 
 // processName reads /proc on Linux, which needs no external tool, and asks ps

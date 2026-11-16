@@ -437,6 +437,35 @@ func TestUninspectableProcessKeepsPidFile(t *testing.T) {
 	}
 }
 
+// A ps that exits 1 silently for a live process must not read as "loop gone".
+func TestSilentlyFailingPsIsNotAbsence(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err == nil {
+		t.Skip("/proc is available, so ps is not used here")
+	}
+	t.Setenv("HOME", t.TempDir())
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if err := checkInspection(); err == nil {
+		t.Fatal("inspection that cannot see this process must fail the start check")
+	}
+	if err := startBackgroundLoop(filepath.Join(t.TempDir(), "none.json"), time.Hour, true, io.Discard); err == nil {
+		t.Fatal("start should refuse")
+	}
+	mustWrite(t, pidFilePath(), strconv.Itoa(os.Getpid())+"\n")
+	if _, running, err := runningLoopPid(); running || err == nil {
+		t.Fatalf("a live but invisible pid must be an error (running=%v, err=%v)", running, err)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should report the inspection failure")
+	}
+	if _, err := os.Stat(pidFilePath()); err != nil {
+		t.Fatal("pid file must be kept")
+	}
+}
+
 func TestProcNameSeparatesAbsentFromUnreadable(t *testing.T) {
 	root := t.TempDir()
 	if _, _, _, ok := procName(root, 7); ok {
