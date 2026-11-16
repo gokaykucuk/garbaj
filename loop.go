@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -181,27 +182,35 @@ func runningLoopPid() (pid int, running bool, err error) {
 }
 
 // processName reads /proc on Linux, which needs no external tool, and asks ps
-// elsewhere. ps exiting non-zero means the pid is gone; ps failing to run at
-// all is an error, not an answer.
+// elsewhere. Only a positive "no such process" counts as absence: a missing
+// /proc entry, or ps exiting 1 with nothing printed. Every other failure is an
+// error, not an answer.
 func processName(pid int) (name string, found bool, err error) {
 	if runtime.GOOS == "linux" {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-		if err == nil {
-			return strings.TrimSpace(string(data)), true, nil
-		}
 		if _, procErr := os.Stat("/proc/self"); procErr == nil {
-			return "", false, nil
+			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				return "", false, nil
+			}
+			if err != nil {
+				return "", false, err
+			}
+			return strings.TrimSpace(string(data)), true, nil
 		}
 	}
 	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
+	name = strings.TrimSpace(string(out))
 	var exit *exec.ExitError
-	if errors.As(err, &exit) {
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && name == "" && len(bytes.TrimSpace(exit.Stderr)) == 0 {
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("ps: %w", err)
 	}
-	return strings.TrimSpace(string(out)), true, nil
+	if name == "" {
+		return "", false, errors.New("ps printed no process name")
+	}
+	return name, true, nil
 }
 
 // Linux truncates process names to 15 bytes.
