@@ -315,14 +315,17 @@ func TestPaletteOnShortensHomeAndHighlightsName(t *testing.T) {
 }
 
 func TestScanSummary(t *testing.T) {
-	cases := map[string]string{
-		scanSummary(0, 0, 0): "no managed worktrees found",
-		scanSummary(3, 1, 0): "3 worktrees: 1 safe, 2 kept",
-		scanSummary(3, 1, 2): "3 worktrees: 1 safe, 2 kept; 2 orphan leftovers",
+	cases := []struct {
+		worktrees, safe, orphans int
+		want                     string
+	}{
+		{0, 0, 0, "no managed worktrees found"},
+		{3, 1, 0, "3 worktrees: 1 safe, 2 kept"},
+		{3, 1, 2, "3 worktrees: 1 safe, 2 kept; 2 orphan leftovers"},
 	}
-	for got, want := range cases {
-		if got != want {
-			t.Errorf("summary = %q, want %q", got, want)
+	for _, c := range cases {
+		if got := scanSummary(c.worktrees, c.safe, c.orphans); got != c.want {
+			t.Errorf("scanSummary(%d, %d, %d) = %q, want %q", c.worktrees, c.safe, c.orphans, got, c.want)
 		}
 	}
 }
@@ -381,12 +384,12 @@ func TestStopIgnoresPidFileOfAnotherProgram(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, ok := runningLoopPid(); ok {
-		t.Fatal("no pid file should mean no running loop")
+	if _, running, err := runningLoopPid(); running || err != nil {
+		t.Fatalf("no pid file should mean no running loop (running=%v, err=%v)", running, err)
 	}
 	writePid(os.Getppid())
-	if pid, ok := runningLoopPid(); ok {
-		t.Fatalf("pid %d belongs to the test runner, not garbaj", pid)
+	if pid, running, err := runningLoopPid(); running || err != nil {
+		t.Fatalf("pid %d belongs to the test runner, not garbaj (err=%v)", pid, err)
 	}
 	if err := stopBackgroundLoop(io.Discard); err == nil {
 		t.Fatal("stop should refuse when no garbaj loop is running")
@@ -395,7 +398,32 @@ func TestStopIgnoresPidFileOfAnotherProgram(t *testing.T) {
 		t.Fatal("stale pid file should be cleaned up")
 	}
 	writePid(os.Getpid())
-	if pid, ok := runningLoopPid(); !ok || pid != os.Getpid() {
-		t.Fatal("this test binary should be recognised as the running program")
+	if pid, running, err := runningLoopPid(); !running || err != nil || pid != os.Getpid() {
+		t.Fatalf("this test binary should be recognised as the running program (err=%v)", err)
+	}
+}
+
+// When the process cannot be inspected, neither start nor stop may assume the
+// loop is gone: that would orphan it and allow a second one.
+func TestUninspectableProcessKeepsPidFile(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err == nil {
+		t.Skip("/proc is available, so ps is not needed here")
+	}
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(pidFilePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidFilePath(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	if _, running, err := runningLoopPid(); running || err == nil {
+		t.Fatalf("expected an inspection error without ps (running=%v, err=%v)", running, err)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should report the inspection failure")
+	}
+	if _, err := os.Stat(pidFilePath()); err != nil {
+		t.Fatal("pid file must be kept when the process cannot be inspected")
 	}
 }
