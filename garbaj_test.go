@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -283,5 +287,202 @@ func TestRenderPlistEscapesAndSetsInterval(t *testing.T) {
 	plist := renderPlist("/bin/a&b", "/cfg.json", "/log", "/usr/bin", 2*time.Hour)
 	if !strings.Contains(plist, "/bin/a&amp;b") || !strings.Contains(plist, "<integer>7200</integer>") {
 		t.Fatalf("unexpected plist:\n%s", plist)
+	}
+}
+
+func TestPaletteOffLeavesTextAndPathsPlain(t *testing.T) {
+	p := palette{}
+	if got := p.green("SAFE"); got != "SAFE" {
+		t.Fatalf("green = %q", got)
+	}
+	if got := p.path("/a/b/c/worktree"); got != "/a/b/c/worktree" {
+		t.Fatalf("path = %q", got)
+	}
+	var buf bytes.Buffer
+	if colorEnabled(&buf) {
+		t.Fatal("a buffer is not a terminal")
+	}
+}
+
+func TestPaletteOnShortensHomeAndHighlightsName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got := palette{on: true}.path(filepath.Join(home, "repos", "shop", "wt"))
+	want := "\x1b[2m~/repos/shop/\x1b[0m\x1b[1mwt\x1b[0m"
+	if got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+}
+
+func TestScanSummary(t *testing.T) {
+	cases := []struct {
+		worktrees, safe, orphans int
+		want                     string
+	}{
+		{0, 0, 0, "no managed worktrees found"},
+		{3, 1, 0, "3 worktrees: 1 safe, 2 kept"},
+		{3, 1, 2, "3 worktrees: 1 safe, 2 kept; 2 orphan leftovers"},
+	}
+	for _, c := range cases {
+		if got := scanSummary(c.worktrees, c.safe, c.orphans); got != c.want {
+			t.Errorf("scanSummary(%d, %d, %d) = %q, want %q", c.worktrees, c.safe, c.orphans, got, c.want)
+		}
+	}
+}
+
+func TestLoopRepeatsUntilCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	passes := 0
+	err := loop(ctx, time.Millisecond, &out, func() error {
+		passes++
+		if passes == 3 {
+			cancel()
+		}
+		if passes == 2 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+	if err != nil || passes != 3 {
+		t.Fatalf("err = %v, passes = %d", err, passes)
+	}
+	if !strings.Contains(out.String(), "failed: transient") || !strings.HasSuffix(out.String(), "stopped\n") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestLoopFailsFastOnFirstPass(t *testing.T) {
+	passes := 0
+	err := loop(context.Background(), time.Hour, io.Discard, func() error {
+		passes++
+		return errors.New("bad config")
+	})
+	if err == nil || passes != 1 {
+		t.Fatalf("err = %v, passes = %d", err, passes)
+	}
+}
+
+func TestLoopRejectsShortInterval(t *testing.T) {
+	if err := runLoop("", time.Second, false, io.Discard); err == nil {
+		t.Fatal("expected an error for -every below 1m")
+	}
+	if err := startBackgroundLoop("", time.Second, false, io.Discard); err == nil {
+		t.Fatal("expected an error for -every below 1m")
+	}
+}
+
+// A stale pid file must never make "stop" signal a process that is not garbaj.
+func TestStopIgnoresPidFileOfAnotherProgram(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writePid := func(pid int) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(pidFilePath()), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pidFilePath(), []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, running, err := runningLoopPid(); running || err != nil {
+		t.Fatalf("no pid file should mean no running loop (running=%v, err=%v)", running, err)
+	}
+	writePid(os.Getppid())
+	if pid, running, err := runningLoopPid(); running || err != nil {
+		t.Fatalf("pid %d belongs to the test runner, not garbaj (err=%v)", pid, err)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should refuse when no garbaj loop is running")
+	}
+	if _, err := os.Stat(pidFilePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale pid file should be cleaned up")
+	}
+	writePid(os.Getpid())
+	if pid, running, err := runningLoopPid(); !running || err != nil || pid != os.Getpid() {
+		t.Fatalf("this test binary should be recognised as the running program (err=%v)", err)
+	}
+}
+
+// When the process cannot be inspected, neither start nor stop may assume the
+// loop is gone: that would orphan it and allow a second one.
+func TestUninspectableProcessKeepsPidFile(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err == nil {
+		t.Skip("/proc is available, so ps is not needed here")
+	}
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(pidFilePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidFilePath(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	if _, running, err := runningLoopPid(); running || err == nil {
+		t.Fatalf("expected an inspection error without ps (running=%v, err=%v)", running, err)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should report the inspection failure")
+	}
+	if _, err := os.Stat(pidFilePath()); err != nil {
+		t.Fatal("pid file must be kept when the process cannot be inspected")
+	}
+	if err := os.Remove(pidFilePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := startBackgroundLoop(filepath.Join(t.TempDir(), "none.json"), time.Hour, true, io.Discard); err == nil {
+		t.Fatal("start should refuse when it could not find the loop again to stop it")
+	}
+	if _, err := os.Stat(pidFilePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a refused start must not leave a pid file")
+	}
+}
+
+// A ps that exits 1 silently for a live process must not read as "loop gone".
+func TestSilentlyFailingPsIsNotAbsence(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err == nil {
+		t.Skip("/proc is available, so ps is not used here")
+	}
+	t.Setenv("HOME", t.TempDir())
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ps"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if err := checkInspection(); err == nil {
+		t.Fatal("inspection that cannot see this process must fail the start check")
+	}
+	if err := startBackgroundLoop(filepath.Join(t.TempDir(), "none.json"), time.Hour, true, io.Discard); err == nil {
+		t.Fatal("start should refuse")
+	}
+	mustWrite(t, pidFilePath(), strconv.Itoa(os.Getpid())+"\n")
+	if _, running, err := runningLoopPid(); running || err == nil {
+		t.Fatalf("a live but invisible pid must be an error (running=%v, err=%v)", running, err)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should report the inspection failure")
+	}
+	if _, err := os.Stat(pidFilePath()); err != nil {
+		t.Fatal("pid file must be kept")
+	}
+}
+
+func TestProcNameSeparatesAbsentFromUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if _, _, _, ok := procName(root, 7); ok {
+		t.Fatal("a folder without self is not a procfs")
+	}
+	mustWrite(t, filepath.Join(root, "self", "comm"), "x\n")
+	mustWrite(t, filepath.Join(root, "7", "comm"), "garbaj\n")
+	if name, found, err, ok := procName(root, 7); !ok || !found || err != nil || name != "garbaj" {
+		t.Fatalf("readable entry: name=%q found=%v err=%v ok=%v", name, found, err, ok)
+	}
+	if _, found, err, ok := procName(root, 8); !ok || found || err != nil {
+		t.Fatalf("missing entry should be a clean absence: found=%v err=%v ok=%v", found, err, ok)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "9", "comm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err, ok := procName(root, 9); !ok || found || err == nil {
+		t.Fatalf("unreadable entry must be an error, not absence: found=%v err=%v", found, err)
 	}
 }

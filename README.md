@@ -16,6 +16,7 @@
 [Quick start](#-quick-start) ·
 [How it works](#-how-it-works) ·
 [Safety rules](#-what-counts-as-safe) ·
+[Keeping it running](#-keeping-it-running) ·
 [Commands](#-commands) ·
 [Configuration](#-configuration) ·
 [FAQ](#-faq)
@@ -44,7 +45,7 @@ is low, and it stops as soon as there is enough.
 | 🛡️ **Conservative** | A worktree goes only if it is clean, pushed, unlocked and idle. Anything it cannot inspect is kept. |
 | 🌿 **Branches survive** | Only the checkout is removed. Recreate it any time with `git worktree add`. |
 | 🔍 **Preview first** | `scan` explains every verdict; `run -dry-run` shows exactly what a run would delete. |
-| ⏱️ **Set and forget** | One command schedules it with launchd on macOS. Cron or systemd on Linux. |
+| ⏱️ **Set and forget** | `garbaj loop -bg` keeps it running in the background on macOS and Linux, or let launchd schedule it. |
 | 📦 **Tiny** | One Go binary, standard library only. Needs nothing but `git` at runtime. |
 
 ## 🚀 Quick start
@@ -69,19 +70,46 @@ garbaj scan
 garbaj run -dry-run
 ```
 
-Check that the verdicts match what you expect, then put it on a schedule:
+Check that the verdicts match what you expect, then keep it running:
 
 ```bash
-garbaj install -every 6h
+garbaj loop -bg -every 6h
 ```
 
 > [!TIP]
-> `install` is macOS only. On Linux, schedule `garbaj run` with cron or a systemd
-> timer, for example:
->
-> ```cron
-> 0 */6 * * * $HOME/go/bin/garbaj run >> $HOME/garbaj.log 2>&1
-> ```
+> If `garbaj` is not found after installing, add Go's bin folder to your `PATH`:
+> `export PATH="$HOME/go/bin:$PATH"`.
+
+## 🔁 Keeping it running
+
+Pick whichever fits the machine. All three do the same thing: call `garbaj run` on an
+interval.
+
+| Way | Command | Survives a reboot | Platforms |
+| --- | --- | --- | --- |
+| Foreground loop | `garbaj loop -every 6h` | No | macOS, Linux |
+| Background loop | `garbaj loop -bg -every 6h` | No | macOS, Linux |
+| launchd agent | `garbaj install -every 6h` | Yes | macOS |
+
+`garbaj loop` runs a pass immediately, then one every `-every` (default `6h`, minimum
+`1m`) until you press <kbd>Ctrl</kbd>+<kbd>C</kbd>. The config is reloaded on every
+pass, so edits apply without a restart. Add `-dry-run` to watch what it would do.
+
+With `-bg` it detaches from the terminal and returns straight away. Output goes to
+`~/Library/Logs/garbaj.log` on macOS and `~/.local/state/garbaj/garbaj.log` on Linux.
+Only one background loop runs at a time. To find it again, garbaj reads `/proc` on
+Linux and calls `ps` elsewhere, so `-bg` and `stop` need `ps` on macOS and on Linux
+systems without `/proc`. Stop it with:
+
+```bash
+garbaj stop
+```
+
+On Linux, cron or a systemd timer covers reboots, for example:
+
+```cron
+0 */6 * * * $HOME/go/bin/garbaj run >> $HOME/garbaj.log 2>&1
+```
 
 ## 🧠 How it works
 
@@ -126,7 +154,7 @@ A worktree is **safe** only when *all* of these hold:
 - [x] its `HEAD` commit is on at least one remote branch;
 - [x] nothing in it changed for `idle_hours` (12).
 
-`garbaj scan` prints one verdict per managed worktree:
+`garbaj scan` prints one verdict per managed worktree, then a summary line:
 
 | Verdict | Reason | Meaning |
 | --- | --- | --- |
@@ -160,11 +188,18 @@ removed once idle for `orphan_idle_hours` (72).
 | `garbaj scan` | List every managed worktree with its verdict. Deletes nothing. |
 | `garbaj run -dry-run` | Show what a run would delete right now. |
 | `garbaj run` | Clean up if space is low. |
+| `garbaj loop -every 6h` | Keep running `run` on an interval until interrupted. Accepts `-dry-run`. |
+| `garbaj loop -bg -every 6h` | Start the loop in the background and return. |
+| `garbaj stop` | Stop the background loop. |
 | `garbaj install -every 6h` | Schedule `garbaj run` with launchd; logs to `~/Library/Logs/garbaj.log`. macOS only. |
 | `garbaj uninstall` | Remove the launchd schedule. |
 
 Every command accepts `-config path` to use a config file other than
 `~/.config/garbaj/config.json`.
+
+On a terminal the output is coloured, and paths are shortened to `~` with the
+worktree name highlighted. Piped or logged output stays plain, with full paths. Set
+`NO_COLOR` to turn colours off.
 
 ## ⚙️ Configuration
 
