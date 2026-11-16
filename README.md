@@ -97,7 +97,9 @@ pass, so edits apply without a restart. Add `-dry-run` to watch what it would do
 
 With `-bg` it detaches from the terminal and returns straight away. Output goes to
 `~/Library/Logs/garbaj.log` on macOS and `~/.local/state/garbaj/garbaj.log` on Linux.
-Only one background loop runs at a time; stop it with:
+Only one background loop runs at a time. To find it again, garbaj reads `/proc` on
+Linux and calls `ps` elsewhere, so `-bg` and `stop` need `ps` on macOS and on Linux
+systems without `/proc`. Stop it with:
 
 ```bash
 garbaj stop

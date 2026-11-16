@@ -84,6 +84,10 @@ func startBackgroundLoop(configPath string, every time.Duration, dryRun bool, ou
 	if running {
 		return fmt.Errorf("a background loop is already running (pid %d); stop it with `garbaj stop`", pid)
 	}
+	// Refuse to start a loop that "stop" could not find again later.
+	if _, _, err := processName(os.Getpid()); err != nil {
+		return fmt.Errorf("cannot inspect processes, which `garbaj stop` needs: %w", err)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -187,15 +191,8 @@ func runningLoopPid() (pid int, running bool, err error) {
 // error, not an answer.
 func processName(pid int) (name string, found bool, err error) {
 	if runtime.GOOS == "linux" {
-		if _, procErr := os.Stat("/proc/self"); procErr == nil {
-			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-				return "", false, nil
-			}
-			if err != nil {
-				return "", false, err
-			}
-			return strings.TrimSpace(string(data)), true, nil
+		if name, found, err, ok := procName("/proc", pid); ok {
+			return name, found, err
 		}
 	}
 	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
@@ -211,6 +208,22 @@ func processName(pid int) (name string, found bool, err error) {
 		return "", false, errors.New("ps printed no process name")
 	}
 	return name, true, nil
+}
+
+// procName reports ok=false when root is not a mounted procfs, so the caller
+// can fall back to ps.
+func procName(root string, pid int) (name string, found bool, err error, ok bool) {
+	if _, statErr := os.Stat(filepath.Join(root, "self")); statErr != nil {
+		return "", false, nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "comm"))
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+		return "", false, nil, true
+	}
+	if err != nil {
+		return "", false, err, true
+	}
+	return strings.TrimSpace(string(data)), true, nil, true
 }
 
 // Linux truncates process names to 15 bytes.

@@ -426,4 +426,34 @@ func TestUninspectableProcessKeepsPidFile(t *testing.T) {
 	if _, err := os.Stat(pidFilePath()); err != nil {
 		t.Fatal("pid file must be kept when the process cannot be inspected")
 	}
+	if err := os.Remove(pidFilePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := startBackgroundLoop(filepath.Join(t.TempDir(), "none.json"), time.Hour, true, io.Discard); err == nil {
+		t.Fatal("start should refuse when it could not find the loop again to stop it")
+	}
+	if _, err := os.Stat(pidFilePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a refused start must not leave a pid file")
+	}
+}
+
+func TestProcNameSeparatesAbsentFromUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if _, _, _, ok := procName(root, 7); ok {
+		t.Fatal("a folder without self is not a procfs")
+	}
+	mustWrite(t, filepath.Join(root, "self", "comm"), "x\n")
+	mustWrite(t, filepath.Join(root, "7", "comm"), "garbaj\n")
+	if name, found, err, ok := procName(root, 7); !ok || !found || err != nil || name != "garbaj" {
+		t.Fatalf("readable entry: name=%q found=%v err=%v ok=%v", name, found, err, ok)
+	}
+	if _, found, err, ok := procName(root, 8); !ok || found || err != nil {
+		t.Fatalf("missing entry should be a clean absence: found=%v err=%v ok=%v", found, err, ok)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "9", "comm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err, ok := procName(root, 9); !ok || found || err == nil {
+		t.Fatalf("unreadable entry must be an error, not absence: found=%v err=%v", found, err)
+	}
 }
