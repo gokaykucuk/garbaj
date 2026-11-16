@@ -66,7 +66,7 @@ func installAgent(configPath string, every time.Duration, out io.Writer) error {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return err
 	}
-	logPath := expandHome("~/Library/Logs/garbaj.log")
+	logPath := logFilePath()
 	plist := renderPlist(exe, configPath, logPath, os.Getenv("PATH"), every)
 	if err := os.WriteFile(plistPath(), []byte(plist), 0o644); err != nil {
 		return err

@@ -19,6 +19,7 @@ type Runner struct {
 	dryRun bool
 	free   func() (float64, error)
 	out    io.Writer
+	pal    palette
 }
 
 type Survey struct {
@@ -33,6 +34,7 @@ func newRunner(cfg Config, dryRun bool, out io.Writer) *Runner {
 		dryRun: dryRun,
 		free:   func() (float64, error) { return freePercent(cfg.Volume) },
 		out:    out,
+		pal:    palette{on: colorEnabled(out)},
 	}
 }
 
@@ -74,29 +76,49 @@ func (r *Runner) Scan() error {
 		return err
 	}
 	s := r.survey()
+	safe := 0
 	for _, v := range s.Verdicts {
-		label := "KEEP"
 		if v.Safe {
-			label = "SAFE"
+			safe++
 		}
-		fmt.Fprintf(r.out, "%s  %-26s %s\n", label, v.Reason, v.Path)
+		r.printVerdict(v.Safe, v.Reason, v.Path)
 	}
 	for _, orphan := range s.Orphans {
-		fmt.Fprintf(r.out, "SAFE  %-26s %s\n", "orphan leftovers", orphan)
+		r.printVerdict(true, "orphan leftovers", orphan)
 	}
+	fmt.Fprintln(r.out, r.pal.dim(scanSummary(len(s.Verdicts), safe, len(s.Orphans))))
 	return nil
+}
+
+func (r *Runner) printVerdict(safe bool, reason, path string) {
+	label := r.pal.yellow("KEEP")
+	if safe {
+		label = r.pal.green("SAFE")
+	}
+	fmt.Fprintf(r.out, "%s  %s %s\n", label, r.pal.dim(fmt.Sprintf("%-26s", reason)), r.pal.path(path))
+}
+
+func scanSummary(worktrees, safe, orphans int) string {
+	if worktrees == 0 && orphans == 0 {
+		return "no managed worktrees found"
+	}
+	summary := fmt.Sprintf("%d worktrees: %d safe, %d kept", worktrees, safe, worktrees-safe)
+	if orphans > 0 {
+		summary += fmt.Sprintf("; %d orphan leftovers", orphans)
+	}
+	return summary
 }
 
 // Run removes the longest-idle safe worktrees first and stops as soon as
 // free space is back above the soft threshold. Caches are only cleared
 // when that still leaves the disk below the hard threshold.
 func (r *Runner) Run() error {
-	fmt.Fprintln(r.out, r.now.Format(time.RFC3339))
+	fmt.Fprintln(r.out, r.pal.dim(r.now.Format(time.RFC3339)))
 	if err := r.printFree(); err != nil {
 		return err
 	}
 	if !r.below(r.cfg.SoftFreePercent) {
-		fmt.Fprintln(r.out, "enough free space, nothing to do")
+		fmt.Fprintln(r.out, r.pal.green("enough free space, nothing to do"))
 		return nil
 	}
 	r.reclaim(r.survey())
@@ -111,8 +133,14 @@ func (r *Runner) printFree() error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "free space %.1f%% (soft %.0f%%, hard %.0f%%)\n",
-		pct, r.cfg.SoftFreePercent, r.cfg.HardFreePercent)
+	level := r.pal.green
+	if pct < r.cfg.HardFreePercent {
+		level = r.pal.red
+	} else if pct < r.cfg.SoftFreePercent {
+		level = r.pal.yellow
+	}
+	fmt.Fprintf(r.out, "free space %s %s\n", level(fmt.Sprintf("%.1f%%", pct)),
+		r.pal.dim(fmt.Sprintf("(soft %.0f%%, hard %.0f%%)", r.cfg.SoftFreePercent, r.cfg.HardFreePercent)))
 	return nil
 }
 
@@ -139,12 +167,12 @@ func (r *Runner) reclaim(s Survey) {
 }
 
 func (r *Runner) removeWorktree(wt Worktree) {
-	fmt.Fprintln(r.out, r.verb("remove worktree"), wt.Path)
+	fmt.Fprintln(r.out, r.verb("remove worktree"), r.pal.path(wt.Path))
 	if r.dryRun {
 		return
 	}
 	if _, err := git(wt.Repo, "worktree", "remove", "--force", wt.Path); err != nil {
-		fmt.Fprintln(r.out, "  failed:", err)
+		fmt.Fprintln(r.out, r.pal.red("  failed:"), err)
 	}
 }
 
@@ -156,12 +184,12 @@ func (r *Runner) removeDir(kind, path string) {
 	if _, err := os.Lstat(path); err != nil {
 		return
 	}
-	fmt.Fprintln(r.out, r.verb("remove "+kind), path)
+	fmt.Fprintln(r.out, r.verb("remove "+kind), r.pal.path(path))
 	if r.dryRun {
 		return
 	}
 	if err := os.RemoveAll(path); err != nil {
-		fmt.Fprintln(r.out, "  failed:", err)
+		fmt.Fprintln(r.out, r.pal.red("  failed:"), err)
 	}
 }
 
@@ -183,14 +211,14 @@ func (r *Runner) clearCaches() {
 			continue
 		}
 		if err := exec.Command(command[0], command[1:]...).Run(); err != nil {
-			fmt.Fprintln(r.out, "  failed:", err)
+			fmt.Fprintln(r.out, r.pal.red("  failed:"), err)
 		}
 	}
 }
 
 func (r *Runner) verb(action string) string {
 	if r.dryRun {
-		return "would " + action
+		return r.pal.yellow("would " + action)
 	}
-	return action
+	return r.pal.red(action)
 }

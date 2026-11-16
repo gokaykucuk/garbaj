@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -283,5 +287,115 @@ func TestRenderPlistEscapesAndSetsInterval(t *testing.T) {
 	plist := renderPlist("/bin/a&b", "/cfg.json", "/log", "/usr/bin", 2*time.Hour)
 	if !strings.Contains(plist, "/bin/a&amp;b") || !strings.Contains(plist, "<integer>7200</integer>") {
 		t.Fatalf("unexpected plist:\n%s", plist)
+	}
+}
+
+func TestPaletteOffLeavesTextAndPathsPlain(t *testing.T) {
+	p := palette{}
+	if got := p.green("SAFE"); got != "SAFE" {
+		t.Fatalf("green = %q", got)
+	}
+	if got := p.path("/a/b/c/worktree"); got != "/a/b/c/worktree" {
+		t.Fatalf("path = %q", got)
+	}
+	var buf bytes.Buffer
+	if colorEnabled(&buf) {
+		t.Fatal("a buffer is not a terminal")
+	}
+}
+
+func TestPaletteOnShortensHomeAndHighlightsName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got := palette{on: true}.path(filepath.Join(home, "repos", "shop", "wt"))
+	want := "\x1b[2m~/repos/shop/\x1b[0m\x1b[1mwt\x1b[0m"
+	if got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+}
+
+func TestScanSummary(t *testing.T) {
+	cases := map[string]string{
+		scanSummary(0, 0, 0): "no managed worktrees found",
+		scanSummary(3, 1, 0): "3 worktrees: 1 safe, 2 kept",
+		scanSummary(3, 1, 2): "3 worktrees: 1 safe, 2 kept; 2 orphan leftovers",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("summary = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestLoopRepeatsUntilCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	passes := 0
+	err := loop(ctx, time.Millisecond, &out, func() error {
+		passes++
+		if passes == 3 {
+			cancel()
+		}
+		if passes == 2 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+	if err != nil || passes != 3 {
+		t.Fatalf("err = %v, passes = %d", err, passes)
+	}
+	if !strings.Contains(out.String(), "failed: transient") || !strings.HasSuffix(out.String(), "stopped\n") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestLoopFailsFastOnFirstPass(t *testing.T) {
+	passes := 0
+	err := loop(context.Background(), time.Hour, io.Discard, func() error {
+		passes++
+		return errors.New("bad config")
+	})
+	if err == nil || passes != 1 {
+		t.Fatalf("err = %v, passes = %d", err, passes)
+	}
+}
+
+func TestLoopRejectsShortInterval(t *testing.T) {
+	if err := runLoop("", time.Second, false, io.Discard); err == nil {
+		t.Fatal("expected an error for -every below 1m")
+	}
+	if err := startBackgroundLoop("", time.Second, false, io.Discard); err == nil {
+		t.Fatal("expected an error for -every below 1m")
+	}
+}
+
+// A stale pid file must never make "stop" signal a process that is not garbaj.
+func TestStopIgnoresPidFileOfAnotherProgram(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writePid := func(pid int) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(pidFilePath()), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(pidFilePath(), []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := runningLoopPid(); ok {
+		t.Fatal("no pid file should mean no running loop")
+	}
+	writePid(os.Getppid())
+	if pid, ok := runningLoopPid(); ok {
+		t.Fatalf("pid %d belongs to the test runner, not garbaj", pid)
+	}
+	if err := stopBackgroundLoop(io.Discard); err == nil {
+		t.Fatal("stop should refuse when no garbaj loop is running")
+	}
+	if _, err := os.Stat(pidFilePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale pid file should be cleaned up")
+	}
+	writePid(os.Getpid())
+	if pid, ok := runningLoopPid(); !ok || pid != os.Getpid() {
+		t.Fatal("this test binary should be recognised as the running program")
 	}
 }
